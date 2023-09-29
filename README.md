@@ -1,7 +1,7 @@
 # abccas2
 ABC 80 data casette audio transmitter
 
-## usage: abccas2 [<options>] [<file>[.bas|.bac|.*]]
+## usage: abccas2 \[<options>\] \[<file>\[.bas\|.bac\|.*\]\]
 ### OPTIONS
          -h             display help and exit
          -v             verbose
