@@ -10,6 +10,7 @@
  *         -b 700|2400    baud rate (700)
  *         -r >1400       audio file sample rate (11200)
  *         -f wav|au|raw  audio format (wav)
+ *         -z 8|16|24|32  bits per channel (8)
  *         -o <filename>  audio output filename (stdout)
  *
  * generates <file>[.bac|.bas].[wav|au] (-o option only) 
@@ -39,20 +40,20 @@
 #define AUDIO_FORMAT_AU    2
 #define DEFAULT_AUDIO_FORMAT AUDIO_FORMAT_WAV
 
-#define DEFAULT_SAMPLE_RATE 11200
-#define DEFAULT_BAUD        700
-#define BITS_PER_CHANNEL    16
-#define NUM_CHANNELS        1
+#define DEFAULT_SAMPLE_RATE      11200
+#define DEFAULT_BAUD             700
+#define DEFAULT_BITS_PER_CHANNEL 8
+#define DEFAULT_NUM_CHANNELS     1
 #define LOW_LEVEL -0.504
 #define HIGH_LEVEL 0.678
 
-#if BITS_PER_CHANNEL == 8
-typedef uint8_t sample_t;
-#elif BITS_PER_CHANNEL == 16
-typedef uint16_t sample_t;
-#else
-#error "BIT_PER_CHANNEL not defined"
-#endif
+typedef union {
+    uint8_t  u8;
+    uint16_t u16;
+    uint8_t  u24[3];
+    uint32_t u32;
+    uint8_t  data[4];
+} sample_t;
 
 typedef struct {
     uint8_t header[3];
@@ -77,8 +78,10 @@ int baud = DEFAULT_BAUD;   // baud
 int sample_rate = DEFAULT_SAMPLE_RATE;   // initial sample rate
 int hbitsz = (DEFAULT_SAMPLE_RATE/DEFAULT_BAUD)/2;
 int bitsz  = DEFAULT_SAMPLE_RATE/DEFAULT_BAUD;
+uint16_t frame_size = (DEFAULT_BITS_PER_CHANNEL*DEFAULT_NUM_CHANNELS+7)/8;
 
 int verbose = 0;
+
 
 #define MAX_HBITSZ 128
 
@@ -107,36 +110,75 @@ int verbose = 0;
 //
 typedef struct bstate {
     int bx;
-    sample_t low;    
-    sample_t high;
+    sample_t wl;
+    sample_t wh;
 } bstate_t;
 
 bstate_t bit_state = { .bx = 1 };
 
-sample_t high_samples[MAX_HBITSZ];
-sample_t low_samples[MAX_HBITSZ];
+uint8_t high_samples[MAX_HBITSZ*4];
+uint8_t low_samples[MAX_HBITSZ*4];
 
-void init_bits(bstate_t* bst, sample_t low, sample_t high)
+void init_bits(bstate_t* bst, int bits_per_channel, sample_t wl, sample_t wh)
 {
     int i;
+    uint8_t* hptr;
+    uint8_t* lptr;
+    
+    bst->wl = wl;
+    bst->wh = wh;
 
-    bst->low = low;
-    bst->high = high;
+    lptr = low_samples;        
+    hptr = high_samples;
 
-    for (i = 0; i < MAX_HBITSZ; i++) {
-	low_samples[i] = low;
-	high_samples[i] = high;
+    switch(bits_per_channel) {
+    case 8:
+	memset(lptr, wl.u8, MAX_HBITSZ);
+	memset(hptr, wh.u8, MAX_HBITSZ);
+	break;
+    case 16:
+	for (i = 0; i < MAX_HBITSZ; i++) {
+	    memcpy(lptr, &wl.u16, sizeof(wl.u16));
+	    lptr += sizeof(wl.u16);
+	}
+	for (i = 0; i < MAX_HBITSZ; i++) {
+	    memcpy(hptr, &wh.u16, sizeof(wh.u16));
+	    hptr += sizeof(wh.u16);
+	}
+	break;
+    case 24:
+	for (i = 0; i < MAX_HBITSZ; i++) {
+	    memcpy(lptr, &wl.u24, sizeof(wl.u24));
+	    lptr += sizeof(wl.u24);
+	}
+	for (i = 0; i < MAX_HBITSZ; i++) {
+	    memcpy(hptr, &wh.u24, sizeof(wh.u24));
+	    hptr += sizeof(wh.u24);
+	}
+	break;	
+    case 32:
+	for (i = 0; i < MAX_HBITSZ; i++) {
+	    memcpy(lptr, &wl.u32, sizeof(wl.u32));
+	    lptr += sizeof(wl.u32);
+	}
+	for (i = 0; i < MAX_HBITSZ; i++) {
+	    memcpy(hptr, &wh.u32, sizeof(wh.u32));
+	    hptr += sizeof(wh.u32);
+	}
+	break;
+    default:
+	break;
     }
 }
 
 void transmit_bit(bstate_t* bst, int bit, FILE *fout)
 {
     bst->bx = !bst->bx;
-    fwrite(bst->bx ? high_samples : low_samples,sizeof(sample_t),hbitsz,fout);
+    fwrite(bst->bx ? high_samples : low_samples, frame_size, hbitsz, fout);
     
     if (bit) // send "1"
 	bst->bx = !bst->bx;
-    fwrite(bst->bx ? high_samples : low_samples,sizeof(sample_t),hbitsz,fout);
+    fwrite(bst->bx ? high_samples : low_samples, frame_size, hbitsz, fout);
 }
 
 void transmit_byte(uint8_t b, FILE *fout)
@@ -223,8 +265,7 @@ void transmit_data_block(int cnt, char* buf, size_t len, FILE *fout)
 
 void transmit_data_blocks(char* buf, size_t len, FILE *fout)
 {
-    int cnt = 0;
-    
+    int cnt = 0;    
     while (len > 0) {
 	transmit_data_block(cnt++, buf, len, fout);
 	len = (len >= 253) ? len-253 : 0;
@@ -235,13 +276,13 @@ void write_wav(FILE *f, int numsamp, int bits_per_channel, int num_channels)
 {
     int srate;
     uint32_t totlen;
-    uint16_t frame_size = (bits_per_channel*num_channels+7)/8;
+    uint16_t fsize = (bits_per_channel*num_channels+7)/8;
     wav_header_t wav;
 
     if (numsamp < 0)
 	totlen = 0xffffffff;
     else
-	totlen = (5*4 + 24)+numsamp*frame_size;
+	totlen = (5*4 + 24)+numsamp*fsize;
 
     write_tag(f, WAV_ID_RIFF);
     write_32le(f, totlen);
@@ -254,33 +295,35 @@ void write_wav(FILE *f, int numsamp, int bits_per_channel, int num_channels)
     wav.NumChannels = num_channels;      // Mono=1 | Stereo=2
     wav.SampleRate  = sample_rate; // Sample Rate (Binary, in Hz)
     wav.ByteRate    = sample_rate; // Byte Rate = sample rates since mono 8-bit
-    wav.FrameSize   = frame_size;
+    wav.FrameSize   = fsize;
     wav.BitsPerChannel = bits_per_channel;
     write_wav_header(f, &wav);
 
     // "data" + length:32 + data...
     write_tag(f, WAV_ID_DATA);
-    write_32le(f, numsamp*frame_size);
+    write_32le(f, numsamp*fsize);
 }
 
 void write_au(FILE *f, int numsamp, int bits_per_channel, int num_channels)
 {
     int srate;
     uint32_t numbytes;
-    uint16_t frame_size = (bits_per_channel*num_channels+7)/8;    
+    uint16_t fsize = (bits_per_channel*num_channels+7)/8;    
     au_header_t au;
 
     if (numsamp == -1)
 	numbytes = 0xffffffff;  // unknown
     else
-	numbytes = numsamp*frame_size;
+	numbytes = numsamp*fsize;
 
     au.magic = AU_MAGIC;
     au.data_offset = 28;   // minimum
     au.data_size   = numbytes;
     switch(bits_per_channel) {
-    case 8: au.encoding = AU_ENCODING_LINEAR_8; break;
+    case 8:  au.encoding = AU_ENCODING_LINEAR_8; break;
     case 16: au.encoding = AU_ENCODING_LINEAR_16; break;
+    case 24: au.encoding = AU_ENCODING_LINEAR_24; break;
+    case 32: au.encoding = AU_ENCODING_LINEAR_32; break;
     }
     au.sample_rate = sample_rate;
     au.channels    = num_channels;
@@ -294,13 +337,14 @@ void usage()
     fprintf(stderr, "usage: %s [<options>] [<file>[.bas|.bac|other]]\n",
 	    progname);
     fprintf(stderr, "OPTIONS\n");
-    fprintf(stderr, "    -h             help\n");
-    fprintf(stderr, "    -v             verbose\n");    
-    fprintf(stderr, "    -k             konvert \\n to \\r\n");
-    fprintf(stderr, "    -b (700)|2400  baud rate\n");
-    fprintf(stderr, "    -r >1400       sample rate\n");
-    fprintf(stderr, "    -f wav|au|raw  audio format\n");
-    fprintf(stderr, "    -o <filename>  audio output filename\n");
+    fprintf(stderr, "    -h               help\n");
+    fprintf(stderr, "    -v               verbose\n");    
+    fprintf(stderr, "    -k               konvert \\n to \\r\n");
+    fprintf(stderr, "    -b (700)|2400    baud rate\n");
+    fprintf(stderr, "    -r >1400         audio sample rate\n");
+    fprintf(stderr, "    -f (wav)|au|raw  audio format\n");
+    fprintf(stderr, "    -z (8)|16|32     audio bits per channel\n");    
+    fprintf(stderr, "    -o <filename>    audio output filename\n");
     exit(1);
 }
 
@@ -332,7 +376,7 @@ size_t konvert_line(char* ptr, size_t len)
 int main(char argc, char *argv[])
 {
     int filelen=-1;
-    int numblk,numsamp,numbyte,blockcnt;
+    int numblk,numsamp,numbyte;
     // struct stat filestat;
     FILE* fin = stdin;
     FILE* fout = stdout;
@@ -343,11 +387,13 @@ int main(char argc, char *argv[])
     int opt;
     int rate0 = DEFAULT_SAMPLE_RATE;
     int br;
-    int audio_format = DEFAULT_AUDIO_FORMAT;
+    int audio_format = AUDIO_FORMAT_UNDEF;
+    int bits_per_channel = DEFAULT_BITS_PER_CHANNEL;
     char* input_filename = "*stdin*";
     char* output_filename = NULL;
+    sample_t wl, wh;
 
-    while ((opt = getopt(argc, argv, "f:o:vhkb:r:")) != -1) {
+    while ((opt = getopt(argc, argv, "vhkf:o:b:r:z:")) != -1) {
 	switch(opt) {
 	case 'h':
 	    usage();
@@ -363,6 +409,18 @@ int main(char argc, char *argv[])
 	    if (rate0 < 1400)
 		usage();
 	    break;
+	case 'z':
+	    bits_per_channel = atoi(optarg);
+	    switch(bits_per_channel) {
+	    case 8:
+	    case 16:
+	    case 24:
+	    case 32:
+		break;
+	    default:
+		usage();
+	    }
+	    break;	    
 	case 'b':
 	    baud = atoi(optarg);
 	    if ((baud != 700) && (baud != 2400))
@@ -400,7 +458,7 @@ int main(char argc, char *argv[])
 
     if (output_filename != NULL) {
 	if ((ptr = strrchr(output_filename, '.')) != NULL) {
-	    if (audio_format == AUDIO_FORMAT_UNDEF) {
+	    if (audio_format == AUDIO_FORMAT_UNDEF) { // from file extension
 		if (strcasecmp(ptr, ".wav") == 0)
 		    audio_format = AUDIO_FORMAT_WAV;
 		else if (strcasecmp(ptr, ".au") == 0)
@@ -414,6 +472,8 @@ int main(char argc, char *argv[])
 	else
 	    fptr++;
     }
+    if (audio_format == AUDIO_FORMAT_UNDEF)
+	audio_format = DEFAULT_AUDIO_FORMAT;
 
     if (optind < argc) {
 	input_filename = argv[optind];
@@ -448,52 +508,87 @@ int main(char argc, char *argv[])
 	fout = fopen(output_filename,"wb");
     }
 
+    frame_size = (bits_per_channel*DEFAULT_NUM_CHANNELS+7)/8;
+
     if (verbose) {
 	fprintf(stderr, "%s: baud=%d, rate'=%d, rate=%d\n",
 		progname, baud, rate0, sample_rate);
-	fprintf(stderr, "         bitsz=%d, hbitsz=%d\n", bitsz, hbitsz);
 	fprintf(stderr, "         input_filename = %s\n", input_filename);
 	fprintf(stderr, "         output_filename = %s\n", output_filename);
 	fprintf(stderr, "         cassete name = %.8s.%s\n", name, ext);
 	fprintf(stderr, "         audio_format = %d\n", audio_format);
+	fprintf(stderr, "         bitsz=%d, hbitsz=%d\n", bitsz, hbitsz);
+	fprintf(stderr, "         frame_size = %d\n", frame_size);
     }
     
     if ((hbitsz < 1) || (hbitsz > MAX_HBITSZ)) {
 	fprintf(stderr, "rate / baud out of range\n");
 	exit(1);
     }
-    // level is -0.504 ... 0.678
-    if (audio_format == AUDIO_FORMAT_WAV) {     
-#if BITS_PER_CHANNEL == 8  // u8
-	sample_t l = (sample_t)(LOW_LEVEL*0x7f)+0x80;
-	sample_t h = (sample_t)(HIGH_LEVEL*0x7f)+0x80;
-	init_bits(&bit_state, l, h);
-#elif BITS_PER_CHANNEL == 16 // s16_le
-	sample_t l = (sample_t)(LOW_LEVEL*0x7fff);
-	sample_t h = (sample_t)(HIGH_LEVEL*0x7fff);
-	little16(&l);
-	little16(&h);
-	init_bits(&bit_state, l, h);
-#endif
+
+    switch(audio_format) {
+    case AUDIO_FORMAT_WAV:
+	switch(bits_per_channel) {
+	case 8:  // u8
+	    wl.u8 = (uint8_t)(LOW_LEVEL*0x7f)+0x80;
+	    wh.u8 = (uint8_t)(HIGH_LEVEL*0x7f)+0x80;
+	    break;
+	case 16:  // s16_le
+	    wl.u16 = (uint16_t)(LOW_LEVEL*0x7fff);
+	    wh.u16 = (uint16_t)(HIGH_LEVEL*0x7fff);
+	    little16(&wl.u16);
+	    little16(&wh.u16);
+	    break;
+	case 24:
+	    wl.u32 = ((uint32_t)(LOW_LEVEL*0x7fffffff)) << 8;
+	    wh.u32 = ((uint32_t)(HIGH_LEVEL*0x7fffffff)) << 8;
+	    little32(&wl.u32);
+	    little32(&wh.u32);	    
+	    break;
+	case 32:  // s16_le
+	    wl.u32 = (uint32_t)(LOW_LEVEL*0x7fffffff);
+	    wh.u32 = (uint32_t)(HIGH_LEVEL*0x7fffffff);
+	    little32(&wl.u32);
+	    little32(&wh.u32);
+	    break;	    
+	}
+	break;
+    case AUDIO_FORMAT_AU:
+    default:
+	switch(bits_per_channel) {
+	case 8:  // u8
+	    wl.u8 = (uint8_t)(LOW_LEVEL*0x7f)+0x80;
+	    wh.u8 = (uint8_t)(HIGH_LEVEL*0x7f)+0x80;	    
+	    // wl.u8 = (uint8_t)(LOW_LEVEL*0x7f);
+	    // wh.u8 = (uint8_t)(HIGH_LEVEL*0x7f);
+	    break;
+	case 16: // s16_be
+	    wl.u16 = (uint16_t)(LOW_LEVEL*0x7fff);
+	    wh.u16 = (uint16_t)(HIGH_LEVEL*0x7fff);
+	    big16(&wl.u16);
+	    big16(&wh.u16);
+	    break;
+	case 24:  // s24_be
+	    wl.u32 = ((uint32_t)(LOW_LEVEL*0x7fffffff)) << 8;
+	    wh.u32 = ((uint32_t)(HIGH_LEVEL*0x7fffffff)) << 8;
+	    big32(&wl.u32);
+	    big32(&wh.u32);
+	    break;
+	case 32:  // s32_be
+	    wl.u32 = (uint32_t)(LOW_LEVEL*0x7fffffff);
+	    wh.u32 = (uint32_t)(HIGH_LEVEL*0x7fffffff);
+	    big32(&wl.u32);
+	    big32(&wh.u32);
+	    break;  	    
+	}
+	break;
     }
-    else if (audio_format == AUDIO_FORMAT_AU) { // s8 | s16_be
-#if BITS_PER_CHANNEL == 8
-	sample_t l = (sample_t)(LOW_LEVEL*0x7f);
-	sample_t h = (sample_t)(HIGH_LEVEL*0x7f);
-	init_bits(&bit_state, l, h);
-#elif BITS_PER_CHANNEL == 16
-	sample_t l = (sample_t)(LOW_LEVEL*0x7fff);
-	sample_t h = (sample_t)(HIGH_LEVEL*0x7fff);
-	big16(&l);
-	big16(&h);
-	init_bits(&bit_state, l, h);
-#endif
-    }
+    
+    init_bits(&bit_state, bits_per_channel, wl, wh);
 
     // read the file into a buffer
     if ((audio_format == AUDIO_FORMAT_WAV) && (filelen == -1)) {
 	char filebuf[64*1024];
-	uint16_t frame_size = (BITS_PER_CHANNEL*NUM_CHANNELS+7)/8;
 	
 	filelen = fread(filebuf, sizeof(char), sizeof(filebuf), fin);
 	if (verbose)
@@ -503,16 +598,17 @@ int main(char argc, char *argv[])
 	numblk=filelen / 253;
 	if (filelen % 253) numblk++;    // if not exact add block
 	numblk++;                       // add one for name block
-	numsamp = numblk*(32+3+1+256+1+2)*8*bitsz;   // number of samples
+	// number of samples(frames) in audio file
+	numsamp = numblk*(32+3+1+256+1+2)*8*bitsz;
 	numbyte = numsamp*frame_size;
 
 	if (verbose)
 	    fprintf(stderr, "Size:%d Blk:%d Byte:%d Samp:%d\n",
 		    filelen,numblk,numbyte,numsamp);
 	if (audio_format == AUDIO_FORMAT_WAV)
-	    write_wav(fout,numsamp,BITS_PER_CHANNEL,NUM_CHANNELS);
+	    write_wav(fout,numsamp,bits_per_channel,DEFAULT_NUM_CHANNELS);
 	else if (audio_format == AUDIO_FORMAT_AU)
-	    write_au(fout,numsamp,BITS_PER_CHANNEL,NUM_CHANNELS);
+	    write_au(fout,numsamp,bits_per_channel,DEFAULT_NUM_CHANNELS);
 	else
 	    ;
 	transmit_name_block(fout);
@@ -524,9 +620,9 @@ int main(char argc, char *argv[])
 	int cnt = 0;
 
 	if (audio_format == AUDIO_FORMAT_WAV)
-	    write_wav(fout,-1,BITS_PER_CHANNEL,NUM_CHANNELS);
+	    write_wav(fout,-1,bits_per_channel,DEFAULT_NUM_CHANNELS);
 	else if (audio_format == AUDIO_FORMAT_AU)
-	    write_au(fout,-1,BITS_PER_CHANNEL,NUM_CHANNELS);
+	    write_au(fout,-1,bits_per_channel,DEFAULT_NUM_CHANNELS);
 	else
 	    ;
 	transmit_name_block(fout);
